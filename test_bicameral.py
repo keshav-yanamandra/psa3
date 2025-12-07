@@ -55,8 +55,9 @@ GROUND_TRUTH = {
     }
 }
 
-# Test parameters
-BOOST_LEVELS = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0]
+# Test parameters - Relative Energy Steering (percentage of base energy)
+# 0.1 = 10% shift, 0.5 = 50% shift - the Goldilocks range
+BOOST_LEVELS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 EPOCHS = 10
 TEMPERATURE = 0.3
 MAX_TOKENS = 50

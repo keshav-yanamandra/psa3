@@ -557,18 +557,24 @@ class LiquidAgent:
                 steering.append(None)
             elif s_pos is None:
                 # Only negative exists, negate it
-                steering.append(-s_neg)
+                delta = -s_neg
             elif s_neg is None:
                 # Only positive exists, use it directly
-                steering.append(s_pos)
+                delta = s_pos
             else:
                 # Both exist, compute difference
-                steering.append(s_pos - s_neg)
+                delta = s_pos - s_neg
+
+            # Normalize to unit vector to prevent energy explosion
+            if delta is not None:
+                norm = torch.norm(delta)
+                delta = delta / (norm + 1e-8)  # Unit vector
+            steering.append(delta)
 
         # Report stats
         non_zero = sum(1 for s in steering if s is not None and s.norm().item() > 1e-6)
         avg_norm = sum(s.norm().item() for s in steering if s is not None) / len(steering)
-        print(f"[*] Steering vector computed: {non_zero}/{len(steering)} non-zero tensors, avg_norm={avg_norm:.4f}")
+        print(f"[*] Steering vector computed: {non_zero}/{len(steering)} normalized tensors, avg_norm={avg_norm:.4f}")
 
         return steering
 
@@ -576,39 +582,72 @@ class LiquidAgent:
         self,
         base_state: Optional[List[torch.Tensor]],
         steering_vector: List[torch.Tensor],
-        multiplier: float = 1.0
+        multiplier: float = 0.2
     ) -> List[torch.Tensor]:
         """
-        Apply a steering vector to a base state.
+        Apply a steering vector using Relative Energy Steering.
 
-        CRITICAL: Unlike apply_delta(), we do NOT normalize here.
-        Steering vectors are directional - we want to push the model
-        HARD in a specific direction in probability space.
+        The Goldilocks Formula:
+            effective_delta = (steering / ||steering||) * ||base|| * boost
 
-        Math:
-            S_new = S_base + (multiplier * Steering)
+        This makes `multiplier` a PERCENTAGE of base state energy:
+            - multiplier=0.1 -> 10% energy shift
+            - multiplier=0.2 -> 20% energy shift
+            - multiplier=0.5 -> 50% energy shift
+
+        Each layer is scaled independently to respect the model's
+        internal energy topology.
 
         Args:
-            base_state: Starting state (None = zeros)
-            steering_vector: The contrastive steering vector
-            multiplier: How hard to push (1.0 = normal, 2.0 = double strength)
+            base_state: Starting state (None = use reference energy)
+            steering_vector: The contrastive steering vector (should be normalized)
+            multiplier: Percentage of base energy to inject (0.2 = 20%)
 
         Returns:
-            Steered state
+            Steered state with relative energy injection
         """
+        import math
+
+        # Reference energy for zero/None base states: sqrt(n_embd) is typical
+        reference_energy = math.sqrt(self.n_embd)
+
         if base_state is None:
-            # Start from zeros
+            # Start from zeros - use reference energy for scaling
             base_state = [torch.zeros_like(s) if s is not None else None for s in steering_vector]
 
         steered = []
         for s_base, s_steer in zip(base_state, steering_vector):
             if s_steer is None:
                 steered.append(s_base)
-            elif s_base is None:
-                steered.append(s_steer * multiplier)
+                continue
+
+            if s_base is None:
+                # No base state - use reference energy
+                effective_delta = s_steer * reference_energy * multiplier
+                steered.append(effective_delta)
+                continue
+
+            # Relative Energy Steering Formula:
+            # 1. Get base state energy (norm)
+            base_norm = torch.norm(s_base).item()
+
+            # 2. If base is near zero, use reference energy
+            if base_norm < 1e-6:
+                base_norm = reference_energy
+
+            # 3. Get steering direction (already normalized, but ensure it)
+            steer_norm = torch.norm(s_steer).item()
+            if steer_norm > 1e-8:
+                direction = s_steer / steer_norm
             else:
-                # Direct addition - NO normalization!
-                steered.append(s_base + (s_steer * multiplier))
+                direction = s_steer
+
+            # 4. Scale to base energy * multiplier (percentage)
+            # multiplier=0.2 means inject 20% of base energy in steering direction
+            effective_delta = direction * base_norm * multiplier
+
+            # 5. Apply steering
+            steered.append(s_base + effective_delta)
 
         return steered
 
