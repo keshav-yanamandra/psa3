@@ -852,6 +852,104 @@ def status():
 
 
 # =============================================================================
+# STEER COMMAND (Project Bicameral - Contrastive Steering)
+# =============================================================================
+
+@app.command()
+def steer(
+    positive: str = typer.Argument(..., help="The TRUE/desired text (e.g., 'The port is 8088')"),
+    negative: str = typer.Argument(..., help="The FALSE/undesired text (e.g., 'The port is 8080')"),
+    name: str = typer.Option(..., "--name", "-n", help="Name for the steering vector"),
+    boost: float = typer.Option(1.0, "--boost", "-b", help="Steering multiplier (1.0=normal, 2.0=double)"),
+    epochs: int = typer.Option(10, "--epochs", "-e", help="Learning epochs per text")
+):
+    """
+    Create a Contrastive Steering Vector (Project Bicameral).
+
+    Instead of teaching what IS true, we teach the DIFFERENCE between
+    truth and falsehood. The resulting vector pushes probability mass
+    FROM the negative TOWARD the positive.
+
+    Math:
+        Steering = State(positive) - State(negative)
+
+    Example:
+        psa steer "The port is 8088" "The port is 8080" --name hydra_port --boost 2.0
+
+    This creates a vector that makes the model MORE likely to say "8088"
+    and LESS likely to say "8080", without any prompt injection.
+    """
+    console.print(Panel.fit(
+        f"[bold magenta]Contrastive Steering[/bold magenta]\n"
+        f"[green]Positive:[/green] {positive}\n"
+        f"[red]Negative:[/red] {negative}\n"
+        f"[cyan]Boost:[/cyan] {boost}x\n"
+        f"[cyan]Epochs:[/cyan] {epochs}",
+        title="Project Bicameral"
+    ))
+
+    # Load kernel
+    with console.status("[bold green]Loading Base Model..."):
+        kernel = get_kernel()
+
+    # Compute steering vector
+    with console.status("[bold magenta]Computing contrastive steering vector..."):
+        steering = kernel.compute_steering_vector(
+            positive_text=positive,
+            negative_text=negative,
+            epochs=epochs
+        )
+
+    # Save steering vector
+    steering_path = DELTAS_DIR / f"{name}.steering"
+    kernel.save_steering_vector(
+        steering,
+        str(steering_path),
+        positive_text=positive,
+        negative_text=negative
+    )
+
+    # Save metadata
+    meta_path = DELTAS_DIR / f"{name}.json"
+    stats = kernel.get_state_stats(steering)
+    metadata = {
+        "name": name,
+        "type": "contrastive_steering",
+        "positive_text": positive,
+        "negative_text": negative,
+        "boost": boost,
+        "epochs": epochs,
+        "created_at": datetime.now().isoformat(),
+        "stats": stats
+    }
+    meta_path.write_text(json.dumps(metadata, indent=2))
+
+    console.print(Panel.fit(
+        f"[green]Steering Vector Created![/green]\n\n"
+        f"Name: {name}\n"
+        f"File: {steering_path}\n"
+        f"Size: {stats['size_mb']:.2f} MB\n"
+        f"Avg Norm: {stats['avg_norm']:.4f}\n"
+        f"Tensors: {stats['non_null']}/{stats['num_tensors']}",
+        title="Contrastive Steering Saved"
+    ))
+
+    console.print("\n[bold cyan]Usage:[/bold cyan]")
+    console.print(f"  psa chat --deltas {name} --gains {boost}")
+    console.print(f"\n[dim]Or in Python:[/dim]")
+    console.print(f"  steering = kernel.load_state('{steering_path}')")
+    console.print(f"  state = kernel.apply_steering(None, steering, multiplier={boost})")
+
+    log_action("steer", {
+        "name": name,
+        "positive": positive,
+        "negative": negative,
+        "boost": boost,
+        "epochs": epochs
+    })
+
+
+# =============================================================================
 # LEGACY ALIASES
 # =============================================================================
 

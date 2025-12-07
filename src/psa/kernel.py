@@ -506,3 +506,128 @@ class LiquidAgent:
         stats['size_mb'] = stats['total_params'] * 2 / (1024 * 1024)  # fp16
 
         return stats
+
+    # =========================================================================
+    # CONTRASTIVE STEERING (Project Bicameral)
+    # =========================================================================
+
+    def compute_steering_vector(
+        self,
+        positive_text: str,
+        negative_text: str,
+        epochs: int = 10
+    ) -> List[torch.Tensor]:
+        """
+        Compute a contrastive steering vector.
+
+        Instead of learning what IS true, we learn the DIFFERENCE between
+        truth and falsehood. This creates a directional vector that pushes
+        probability mass from the negative toward the positive.
+
+        Math:
+            S_pos = learn(positive_text)  # "The port is 8088"
+            S_neg = learn(negative_text)  # "The port is 8080"
+            Steering = S_pos - S_neg      # Points FROM 8080 TOWARD 8088
+
+        Args:
+            positive_text: The true/desired text
+            negative_text: The false/undesired text
+            epochs: Number of passes for each text (reinforcement)
+
+        Returns:
+            Steering vector (list of tensors)
+        """
+        print(f"[*] Computing steering vector...")
+        print(f"    Positive: {positive_text[:50]}{'...' if len(positive_text) > 50 else ''}")
+        print(f"    Negative: {negative_text[:50]}{'...' if len(negative_text) > 50 else ''}")
+
+        # Learn positive state (truth)
+        print(f"[*] Learning positive state ({epochs} epochs)...")
+        pos_state = self.learn_stream(positive_text, initial_state=None, epochs=epochs)
+
+        # Learn negative state (lie)
+        print(f"[*] Learning negative state ({epochs} epochs)...")
+        neg_state = self.learn_stream(negative_text, initial_state=None, epochs=epochs)
+
+        # Compute steering vector: S_pos - S_neg
+        # This vector points FROM the lie TOWARD the truth
+        steering = []
+        for s_pos, s_neg in zip(pos_state, neg_state):
+            if s_pos is None and s_neg is None:
+                steering.append(None)
+            elif s_pos is None:
+                # Only negative exists, negate it
+                steering.append(-s_neg)
+            elif s_neg is None:
+                # Only positive exists, use it directly
+                steering.append(s_pos)
+            else:
+                # Both exist, compute difference
+                steering.append(s_pos - s_neg)
+
+        # Report stats
+        non_zero = sum(1 for s in steering if s is not None and s.norm().item() > 1e-6)
+        avg_norm = sum(s.norm().item() for s in steering if s is not None) / len(steering)
+        print(f"[*] Steering vector computed: {non_zero}/{len(steering)} non-zero tensors, avg_norm={avg_norm:.4f}")
+
+        return steering
+
+    def apply_steering(
+        self,
+        base_state: Optional[List[torch.Tensor]],
+        steering_vector: List[torch.Tensor],
+        multiplier: float = 1.0
+    ) -> List[torch.Tensor]:
+        """
+        Apply a steering vector to a base state.
+
+        CRITICAL: Unlike apply_delta(), we do NOT normalize here.
+        Steering vectors are directional - we want to push the model
+        HARD in a specific direction in probability space.
+
+        Math:
+            S_new = S_base + (multiplier * Steering)
+
+        Args:
+            base_state: Starting state (None = zeros)
+            steering_vector: The contrastive steering vector
+            multiplier: How hard to push (1.0 = normal, 2.0 = double strength)
+
+        Returns:
+            Steered state
+        """
+        if base_state is None:
+            # Start from zeros
+            base_state = [torch.zeros_like(s) if s is not None else None for s in steering_vector]
+
+        steered = []
+        for s_base, s_steer in zip(base_state, steering_vector):
+            if s_steer is None:
+                steered.append(s_base)
+            elif s_base is None:
+                steered.append(s_steer * multiplier)
+            else:
+                # Direct addition - NO normalization!
+                steered.append(s_base + (s_steer * multiplier))
+
+        return steered
+
+    def save_steering_vector(
+        self,
+        steering: List[torch.Tensor],
+        filepath: str,
+        positive_text: str = "",
+        negative_text: str = ""
+    ):
+        """Save steering vector with metadata."""
+        cpu_state = [s.cpu() if s is not None else None for s in steering]
+
+        torch.save({
+            'state': cpu_state,
+            'n_layer': self.n_layer,
+            'n_embd': self.n_embd,
+            'version': 'psa_v3_steering',
+            'type': 'contrastive_steering',
+            'positive_text': positive_text,
+            'negative_text': negative_text,
+        }, filepath)
