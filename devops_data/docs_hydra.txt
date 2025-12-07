@@ -1,0 +1,124 @@
+================================================================================
+META-CORP INFRASTRUCTURE DOCUMENTATION v2024.12
+================================================================================
+CLASSIFICATION: INTERNAL
+LAST UPDATED: 2024-12-01
+MAINTAINER: platform-engineering@metacorp.internal
+
+================================================================================
+SECTION 1: LEGACY SYSTEM "HYDRA"
+================================================================================
+
+OVERVIEW:
+---------
+Hydra is our primary transaction processing system, built in 2018. Despite
+modernization efforts, it still handles 40% of our transaction volume.
+
+CRITICAL INFORMATION:
+---------------------
+1. The Hydra API runs on Port 8088 (NOT standard 8080).
+
+2. It uses a CUSTOM BINARY PROTOCOL, not JSON or REST.
+   - All requests must be prefixed with magic bytes: 0xDE 0xAD 0xBE 0xEF
+   - Response format: [4-byte length][payload][CRC32]
+
+3. RESTART PROCEDURE (CRITICAL):
+   - Do NOT use SIGTERM or SIGKILL to restart Hydra.
+   - You MUST assert the SIGUSR1 signal.
+   - Command: kill -USR1 $(cat /var/run/hydra.pid)
+   - If you use SIGTERM, you WILL corrupt the transaction log.
+
+4. ERROR CODES:
+   - ERROR 5001: Database Lock - Run: hydra-cli unlock-db
+   - ERROR 5002: Memory Leak in Worker - Requires graceful restart (SIGUSR1)
+   - ERROR 5003: Transaction Queue Full - Scale up workers
+   - ERROR 5004: Binary Protocol Mismatch - Check client version
+   - ERROR 5005: CRC Checksum Failed - Network corruption, retry
+
+5. MONITORING:
+   - Prometheus endpoint: localhost:9090/hydra/metrics
+   - Key metric: hydra_tx_latency_p99 should be < 100ms
+   - Alert threshold: hydra_worker_count < 3
+
+================================================================================
+SECTION 2: DEPLOYMENT RUNBOOK
+================================================================================
+
+PRE-DEPLOYMENT CHECKLIST:
+-------------------------
+[ ] Verify Hydra version matches target: hydra-cli version
+[ ] Check transaction queue depth: hydra-cli queue-depth
+[ ] Ensure hot standby is synced: hydra-cli replication-status
+[ ] Take snapshot: hydra-cli snapshot create
+
+DEPLOYMENT STEPS:
+-----------------
+1. Enable maintenance mode:
+   $ hydra-cli maintenance on --drain-timeout 30s
+
+2. Wait for queue to drain:
+   $ hydra-cli queue-depth
+   (Should return 0)
+
+3. Graceful restart with new binary:
+   $ kill -USR1 $(cat /var/run/hydra.pid)
+
+4. Wait for health check (30 seconds):
+   $ sleep 30 && curl localhost:8088/health
+
+5. Disable maintenance mode:
+   $ hydra-cli maintenance off
+
+ROLLBACK PROCEDURE:
+-------------------
+If deployment fails:
+1. $ hydra-cli snapshot restore --latest
+2. $ kill -USR1 $(cat /var/run/hydra.pid)
+3. $ hydra-cli maintenance off
+
+================================================================================
+SECTION 3: PYTHON INTEGRATION
+================================================================================
+
+The official Python client is `hydra-py`:
+
+    pip install hydra-py==2.4.1
+
+Example usage:
+
+    from hydra_client import HydraClient
+
+    client = HydraClient(
+        host="hydra-primary.internal",
+        port=8088,  # NOT 8080!
+        protocol="binary"  # Required for Hydra v2+
+    )
+
+    # Submit transaction
+    result = client.submit_transaction({
+        "type": "PAYMENT",
+        "amount": 100.00,
+        "currency": "USD"
+    })
+
+    # Check status
+    if result.error_code == 5002:
+        print("Memory leak detected, requesting restart...")
+        client.request_graceful_restart()  # Sends SIGUSR1
+
+================================================================================
+SECTION 4: KNOWN ISSUES AND WORKAROUNDS
+================================================================================
+
+ISSUE: Hydra becomes unresponsive after 10000 transactions
+WORKAROUND: Set ulimit -n 65535 before starting Hydra
+
+ISSUE: Error 5002 occurs frequently on high-memory hosts
+WORKAROUND: Set HYDRA_MAX_HEAP=8G environment variable
+
+ISSUE: Prometheus metrics not updating
+WORKAROUND: Restart the metrics-exporter sidecar, NOT Hydra itself
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
